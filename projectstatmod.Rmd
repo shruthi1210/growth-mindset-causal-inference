@@ -1,0 +1,380 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+# === Load Required Packages ===
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(cobalt)
+library(car)
+```
+
+```{r}
+# === Load and Prepare Data ===
+data <- read_csv("data-2.csv", show_col_types = FALSE)
+names(data)[names(data) == "y"] <- "outcome"
+names(data)[names(data) == "z"] <- "treatment"
+```
+
+```{r}
+# === EDA Visualizations ===
+# Histogram of Outcome
+ggplot(data, aes(x = outcome, fill = factor(treatment))) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity", color = "black") +
+  labs(title = "Distribution of Outcome by Treatment",
+       x = "Student Achievement", y = "Count", fill = "Treatment") +
+  theme_minimal()
+```
+```{r}
+# Boxplot of Outcome
+ggplot(data, aes(x = factor(treatment), y = outcome, fill = factor(treatment))) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Boxplot of Outcome by Treatment",
+       x = "Treatment Group", y = "Outcome") +
+  theme_minimal()
+
+```
+```{r}
+# Violin Plot of Selfrpt
+ggplot(data, aes(x = factor(treatment), y = selfrpt, fill = factor(treatment))) +
+  geom_violin(alpha = 0.6) +
+  labs(title = "Self-Reported Expectations by Treatment",
+       x = "Treatment Group", y = "Self-Reported Expectations") +
+  theme_minimal()
+```
+```{r}
+# Gender Distribution by Treatment
+ggplot(data, aes(x = factor(gender), fill = factor(treatment))) +
+  geom_bar(position = "dodge") +
+  labs(title = "Gender Distribution by Treatment",
+       x = "Gender", y = "Count", fill = "Treatment") +
+  theme_minimal()
+```
+```{r}
+# === Group-wise Summary ===
+group_summary <- data %>%
+  group_by(treatment) %>%
+  summarise(
+    mean_outcome = mean(outcome, na.rm = TRUE),
+    sd_outcome = sd(outcome, na.rm = TRUE),
+    count = n()
+  )
+
+print("Group Summary Statistics:")
+print(group_summary)
+
+# === Calculate Unadjusted Average Treatment Effect (ATE) ===
+mean_treated <- group_summary$mean_outcome[group_summary$treatment == 1]
+mean_control <- group_summary$mean_outcome[group_summary$treatment == 0]
+ate_unadjusted <- mean_treated - mean_control
+
+cat("\nUnadjusted ATE (Treated - Control):", round(ate_unadjusted, 3), "\n")
+
+# === Optional: Interpretation Output ===
+cat("\nInterpretation:\n")
+cat("Students who received the mindset intervention scored on average",
+    round(ate_unadjusted, 3), 
+    "points higher in achievement compared to those who did not.\n")
+```
+
+
+
+
+```{r}
+# === Regression Analysis ===
+model1 <- lm(outcome ~ treatment + selfrpt + race + gender + fgen + urban + 
+               mindset + test + sch_race + pov + size, data = data)
+summary(model1)
+# Robust SE
+vcovHC <- car::hccm(model1, type = "hc2")
+robust_se <- sqrt(diag(vcovHC))
+
+```
+```{r}
+# === Propensity Score Estimation ===
+ps_model <- glm(treatment ~ selfrpt + race + gender + fgen + urban + 
+                  mindset + test + sch_race + pov + size, 
+                family = binomial, data = data)
+data$pscore <- predict(ps_model, type = "response")
+summary(ps_model)
+str(data$pscore)
+summary(data$pscore)
+
+```
+This tells you:
+
+Each student has a predicted probability between ~18% and ~44% of being assigned to the treatment group.
+The average probability of treatment (across covariates) is about 32.6%, which means your model isn’t too skewed — good balance.
+Interpretation:
+
+Using a logistic regression model with 10 covariates, we estimated each student’s likelihood of receiving the mindset intervention. The predicted propensity scores range from 0.18 to 0.44, with a median of 0.32. These scores reflect the underlying selection probability based on observed characteristics and will be used for inverse probability weighting to adjust for confounding.
+Model Coefficients: Which Variables Influence Treatment?
+
+From your summary(ps_model):
+
+Strongest predictors of receiving treatment:
+selfrpt (positive): Higher self-reported expectations → more likely to be treated
+mindset (negative): Higher fixed mindset score → less likely to be treated
+fgen (negative): First-gen students are less likely to receive the intervention
+gender (negative): Males (if coded as 1) less likely to be treated
+Interpretation (include in Poster/Script):
+
+The probability of receiving the growth mindset intervention was positively associated with students' self-reported expectations and negatively associated with fixed mindset scores, gender, and first-generation college status. These findings highlight selection patterns that must be adjusted for to estimate valid causal effects.
+
+```{r}
+# === Inverse Probability Weighting (IPW) ===
+W <- data$treatment
+Y <- data$outcome
+ps <- data$pscore
+ipw <- mean(W*Y/ps - (1-W)*Y/(1-ps))
+ipw
+```
+
+
+```{r}
+# === IPW with 95% CI (safe bootstrapping) ===
+set.seed(42)
+B <- 100
+n <- nrow(data)
+boot_ipw <- numeric()
+
+for (b in 1:B) {
+  sample_indices <- sample(1:n, n, replace = TRUE)
+  data_b <- data[sample_indices, ]
+  
+  # Refit the PS model inside bootstrap sample
+  ps_model_b <- glm(treatment ~ selfrpt + race + gender + fgen + urban + 
+                      mindset + test + sch_race + pov + size, 
+                    family = binomial, data = data_b)
+  data_b$pscore <- predict(ps_model_b, type = "response")
+  
+  # Skip if extreme or invalid scores
+  if (any(is.na(data_b$pscore)) || any(data_b$pscore <= 0.01 | data_b$pscore >= 0.99)) next
+  
+  W_b <- data_b$treatment
+  Y_b <- data_b$outcome
+  ps_b <- data_b$pscore
+  
+  ipw_b <- tryCatch({
+    mean(W_b * Y_b / ps_b - (1 - W_b) * Y_b / (1 - ps_b))
+  }, error = function(e) NA)
+  
+  boot_ipw <- c(boot_ipw, ipw_b)
+}
+
+# Final cleaned vector
+boot_ipw <- boot_ipw[!is.na(boot_ipw) & is.finite(boot_ipw)]
+
+# CI
+ci_ipw <- quantile(boot_ipw, probs = c(0.025, 0.975))
+
+# Original ATE
+W <- data$treatment
+Y <- data$outcome
+ps <- data$pscore
+ipw <- mean(W * Y / ps - (1 - W) * Y / (1 - ps))
+
+# Output
+cat("IPW ATE:", round(ipw, 3), "\n")
+cat("95% CI:", round(ci_ipw[1], 3), "to", round(ci_ipw[2], 3), "\n")
+
+
+```
+Perfect — your Inverse Probability Weighted (IPW) estimate of the Average Treatment Effect (ATE) is:
+ =0.414
+
+ 
+nterpretation 
+
+After adjusting for differences in observed characteristics using inverse probability weighting, we estimate that the growth mindset intervention increased student achievement by approximately 0.41 points on average. This estimate accounts for selection bias by reweighting students based on their likelihood of receiving the intervention, making the comparison between treated and control groups more credible from a causal inference perspective.
+
+
+
+```{r}
+library(cobalt)
+# Define covariates matrix (drop outcome and treatment if needed)
+covars <- data[, c("selfrpt", "race", "gender", "fgen", "urban", 
+                   "mindset", "test", "sch_race", "pov", "size")]
+
+# Define treatment and IPW weights
+W <- data$treatment
+Y <- data$outcome
+ps <- data$pscore
+# IPW ATE Estimate
+ipw_ate <- mean(W*Y/ps - (1-W)*Y/(1-ps))
+ipw_ate
+ipw_weights <- ifelse(W == 1, 1/ps, 1/(1 - ps))
+
+# Love plot just like Set 11
+love.plot(x = covars,
+          treat = W,
+          weights = ipw_weights,
+          sample.names = c("Unweighted", "PS Weighted"))
+
+```
+Love Plot Interpretation 
+This Love plot visualizes the standardized mean differences (SMDs) for each covariate:
+
+Red dots = Unweighted sample (i.e., before applying IPW)
+Blue dots = PS Weighted sample (i.e., after IPW)
+What It Shows:
+Several covariates (e.g., mindset, fgen, urban, pov, size) had non-trivial imbalances before weighting (red dots away from center).
+After weighting (blue dots), all covariates are very close to zero, indicating good covariate balance.
+No covariates exceed the commonly used imbalance threshold (±0.1) after weighting — mission accomplished.
+
+The Love plot demonstrates the effectiveness of inverse probability weighting in balancing observed covariates. In the unweighted sample, several variables (e.g., mindset, fgen, pov) showed noticeable imbalance between treatment groups. After applying weights based on estimated propensity scores, the standardized mean differences for all covariates dropped substantially, all falling within the ±0.1 threshold. This indicates that the IPW approach successfully adjusted for confounding, supporting a valid causal interpretation of the treatment effect.
+
+
+```{r}
+# === Unadjusted ATE ===
+group_summary <- data %>%
+  group_by(treatment) %>%
+  summarise(
+    mean_outcome = mean(outcome),
+    sd_outcome = sd(outcome),
+    n = n()
+  )
+
+# ATE
+unadj_ate <- group_summary$mean_outcome[group_summary$treatment == 1] -
+             group_summary$mean_outcome[group_summary$treatment == 0]
+
+# Standard Error
+se_unadj <- sqrt(
+  (group_summary$sd_outcome[group_summary$treatment == 1]^2 / group_summary$n[group_summary$treatment == 1]) +
+  (group_summary$sd_outcome[group_summary$treatment == 0]^2 / group_summary$n[group_summary$treatment == 0])
+)
+
+# 95% Confidence Interval
+lower_ci <- unadj_ate - 1.96 * se_unadj
+upper_ci <- unadj_ate + 1.96 * se_unadj
+
+# Print results
+cat("Unadjusted ATE:", round(unadj_ate, 3), "\n")
+cat("95% CI:", round(lower_ci, 3), "to", round(upper_ci, 3), "\n")
+```
+
+```{r}
+# === Regression Adjusted ATE ===
+reg_model <- lm(outcome ~ treatment + selfrpt + race + gender + fgen + urban + 
+                  mindset + test + sch_race + pov + size, data = data)
+summary(reg_model)
+reg_ate <- coef(reg_model)["treatment"]
+reg_ate
+# Point estimate
+reg_ate <- coef(reg_model)["treatment"]
+
+# 95% Confidence Interval
+ci_reg <- confint(reg_model)["treatment", ]
+
+# Output
+cat("Regression-Adjusted ATE:", round(reg_ate, 3), "\n")
+cat("95% CI:", round(ci_reg[1], 3), "to", round(ci_reg[2], 3), "\n")
+```
+
+
+```{r}
+# === AIPW Bootstrap with 95% CI ===
+set.seed(123)
+B <- 100  # Bootstrap iterations
+n <- nrow(data)
+boot_aipw <- numeric(B)
+
+for (b in 1:B) {
+  sample_idx <- sample(1:n, n, replace = TRUE)
+  data_b <- data[sample_idx, ]
+  
+  # Split into fit and estimate sets
+  N_b <- nrow(data_b)
+  fit_idx <- sample(1:N_b, size = ceiling(N_b / 3))
+  est_idx <- setdiff(1:N_b, fit_idx)
+  data_fit <- data_b[fit_idx, ]
+  data_est <- data_b[est_idx, ]
+  
+  # Fit outcome models separately
+  om1 <- tryCatch(
+    lm(outcome ~ selfrpt + race + gender + fgen + urban + mindset +
+         test + sch_race + pov + size, data = data_fit[data_fit$treatment == 1, ]),
+    error = function(e) return(NULL)
+  )
+  om0 <- tryCatch(
+    lm(outcome ~ selfrpt + race + gender + fgen + urban + mindset +
+         test + sch_race + pov + size, data = data_fit[data_fit$treatment == 0, ]),
+    error = function(e) return(NULL)
+  )
+  
+  # Skip if model fitting failed
+  if (is.null(om1) || is.null(om0)) next
+  
+  mu_1_est <- predict(om1, newdata = data_est)
+  mu_0_est <- predict(om0, newdata = data_est)
+  
+  mu_1_dr <- mean(mu_1_est) + 
+    mean((data_est$treatment == 1) * (data_est$outcome - mu_1_est) / 
+         (sum(data_est$treatment == 1) / nrow(data_est)))
+  mu_0_dr <- mean(mu_0_est) + 
+    mean((data_est$treatment == 0) * (data_est$outcome - mu_0_est) / 
+         (sum(data_est$treatment == 0) / nrow(data_est)))
+  
+  boot_aipw[b] <- mu_1_dr - mu_0_dr
+}
+# Clean and compute CI
+boot_aipw <- boot_aipw[!is.na(boot_aipw) & is.finite(boot_aipw)]
+ci_aipw <- quantile(boot_aipw, probs = c(0.025, 0.975))
+aipw_ate <- mean(boot_aipw)
+# Output
+cat("AIPW ATE:", round(aipw_ate, 3), "\n")
+cat("95% CI:", round(ci_aipw[1], 3), "to", round(ci_aipw[2], 3), "\n")
+
+```
+
+```{r}
+# === Final Summary Table Using Variables from Your Code ===
+
+# Collect all ATE estimates and confidence intervals from your environment
+ate_summary <- data.frame(
+  Method = c("Unadjusted ATE",
+             "Regression-Adjusted ATE",
+             "IPW ATE",
+             "AIPW ATE"),
+  
+  ATE = round(c(unadj_ate,
+                reg_ate,
+                ipw,
+                aipw_ate), 3),
+  
+  `95% CI Lower` = round(c(lower_ci,     # from unadj
+                           ci_reg[1],    # from regression
+                           ci_ipw[1],    # from IPW bootstrap
+                           ci_aipw[1]    # from AIPW bootstrap
+                           ), 3),
+  
+  `95% CI Upper` = round(c(upper_ci,     # from unadj
+                           ci_reg[2],
+                           ci_ipw[2],
+                           ci_aipw[2]
+                           ), 3)
+)
+
+# Print table in console
+print(ate_summary)
+
+# Optional: prettier table
+library(knitr)
+kable(ate_summary, caption = "Summary of ATE Estimates with 95% Confidence Intervals")
+
+```
+
+
+
+```
+
+
+
+
+
